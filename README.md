@@ -1,5 +1,7 @@
 # agent-project-onboard
 
+## NOTE - this is 100% AI generated, and should be used with caution! 
+
 Startup recipe for fresh containers/VMs: GitHub SSH access, the `gh` CLI, and
 branch protection for your repos.
 
