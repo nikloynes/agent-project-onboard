@@ -80,7 +80,7 @@ Or run it from anywhere and name the repo, which can be yours or an organisation
 
 ```bash
 ./protect-repo.sh OWNER/REPO --dry-run
-./protect-repo.sh my-org/my_project --admins my-org/maintainers
+./protect-repo.sh my-org/my_project --codeowners my-org/maintainers,alice
 ./protect-repo.sh OWNER/REPO --admin-bypass   # solo projects, see below
 ```
 
@@ -90,10 +90,8 @@ when the connection to GitHub can't be made.
 What it does:
 
 1. Creates `development` from `main` if it doesn't exist.
-2. Commits `.github/CODEOWNERS` with `* @admin1 @admin2` to both branches. By
-   default these are the repo's admin collaborators. In an org that includes
-   every org owner, so a team is usually better: `--admins my-org/maintainers`.
-   The team needs write access to the repo.
+2. Commits `.github/CODEOWNERS` with `* @owner1 @owner2` to both branches. These
+   are the people who can approve; see [Choosing who approves](#choosing-who-approves).
 3. Creates or updates a **repository ruleset** named
    `protect-main-and-development` on both branches:
    - no direct pushes; every change must come through a pull request
@@ -108,8 +106,27 @@ What it does:
 
 GitHub has no "an admin must approve" setting. The standard approach is
 CODEOWNERS plus "require review from code owners": a PR can merge only once a
-listed code owner has approved it. Because the script lists only admins, this
-gives you "an admin must approve". Code owners need write access to the repo.
+listed code owner has approved it. By default the script lists only admins, so
+an admin must approve.
+
+### Choosing who approves
+
+Pass `--codeowners` with users and/or teams, comma-separated:
+
+```bash
+./protect-repo.sh my-org/my_project --codeowners alice,my-org/maintainers
+```
+
+Only the people listed can give the required approval. They are also asked to
+review every PR automatically, so keep the list to people who should be. Each
+must have write access to the repo, because GitHub ignores code owners who
+don't; the script checks this and stops if anyone lacks it. `--admins` is an
+older name for the same option.
+
+Without `--codeowners`, the script uses the repo's admins. In an org, that
+includes every org owner. So for an org repo, or whenever it finds more than one
+admin, it shows the list and asks before using it. Without a terminal to ask in,
+it stops and asks you to pass `--codeowners`.
 
 ### Solo projects: use `--admin-bypass`
 

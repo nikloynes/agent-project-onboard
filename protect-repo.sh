@@ -2,7 +2,8 @@
 # Protect a repo's main and development branches with a GitHub ruleset:
 #   - changes only via pull request (no direct pushes, force-pushes or deletion)
 #   - at least N approvals, one of which must come from a code owner
-#   - CODEOWNERS lists the project admins, so an admin must approve every PR
+#   - CODEOWNERS lists who may approve (default: the repo's admins, or pick them
+#     with --codeowners), so one of them must approve every PR
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/lib/common.sh"
 
@@ -10,7 +11,7 @@ REPO=""
 MAIN_BRANCH=main
 DEV_BRANCH=development
 APPROVALS=1
-ADMINS=""
+CODEOWNERS=""
 ADMIN_BYPASS=false
 WRITE_CODEOWNERS=true
 DRY_RUN=false
@@ -25,8 +26,10 @@ Defaults to the repo of the current directory.
   --main NAME          Main branch (default: $MAIN_BRANCH)
   --dev NAME           Development branch, created from main if missing (default: $DEV_BRANCH)
   --approvals N        Required approvals per PR (default: $APPROVALS)
-  --admins A,B         Who must approve (users, or org/team). Default: the repo's
-                       admin collaborators
+  --codeowners A,B     Who may approve: users and/or org/team, written to
+                       .github/CODEOWNERS. Each needs write access to the repo.
+                       Default: the repo's admins (you're asked to confirm the list
+                       when it's an org repo or has several people). Alias: --admins
   --admin-bypass       Let repo admins merge PRs without the required approval.
                        Needed on solo projects: GitHub won't let you approve your own PR
   --skip-codeowners    Don't write .github/CODEOWNERS (manage it yourself)
@@ -39,7 +42,7 @@ while [[ $# -gt 0 ]]; do
     --main) MAIN_BRANCH=$2; shift 2 ;;
     --dev) DEV_BRANCH=$2; shift 2 ;;
     --approvals) APPROVALS=$2; shift 2 ;;
-    --admins) ADMINS=$2; shift 2 ;;
+    --codeowners|--admins) CODEOWNERS=$2; shift 2 ;;
     --admin-bypass) ADMIN_BYPASS=true; shift ;;
     --skip-codeowners) WRITE_CODEOWNERS=false; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
@@ -78,7 +81,8 @@ if [[ -z $REPO ]]; then
   REPO=$(gh_retry repo view --json nameWithOwner -q .nameWithOwner) \
     || die "Couldn't work out the GitHub repo for $(pwd) (see above). Pass OWNER/REPO."
 fi
-permission=$(gh_retry repo view "$REPO" --json viewerPermission -q .viewerPermission) \
+read -r permission in_org < <(gh_retry repo view "$REPO" --json viewerPermission,isInOrganization \
+  -q '.viewerPermission + " " + (.isInOrganization | tostring)') \
   || die "Can't access $REPO (see above). Check the name and that you have access."
 [[ $permission == ADMIN ]] \
   || die "You need admin rights on $REPO to manage rulesets (you have: ${permission:-none})."
@@ -97,6 +101,63 @@ branch_sha() {
   die "Couldn't look up branch '$1' in $REPO: $out"
 }
 
+# Code owners: decide and validate before changing anything ------------------------
+# Returns 1 (with a warning) if a user/team can't act as a code owner on $REPO.
+check_owner() {
+  local owner=$1 out
+  if [[ $owner == */* ]]; then
+    out=$(gh_retry api "orgs/${owner%%/*}/teams/${owner#*/}/repos/$REPO" \
+      -H "Accept: application/vnd.github.v3.repository+json" -q .permissions.push 2>&1) \
+      || { [[ $out == *"HTTP 404"* ]] || die "Couldn't check team @$owner: $out"
+           warn "Team @$owner doesn't exist or has no access to $REPO"; return 1; }
+    [[ $out == true ]] || { warn "Team @$owner has read-only access to $REPO"; return 1; }
+  else
+    out=$(gh_retry api "repos/$REPO/collaborators/$owner/permission" -q .permission 2>&1) \
+      || { [[ $out == *"HTTP 404"* ]] || die "Couldn't check user @$owner: $out"
+           warn "User @$owner doesn't exist"; return 1; }
+    case $out in
+      admin|maintain|write) ;;
+      *) warn "@$owner has '$out' access to $REPO"; return 1 ;;
+    esac
+  fi
+}
+
+if $WRITE_CODEOWNERS; then
+  auto_detected=false
+  if [[ -z $CODEOWNERS ]]; then
+    auto_detected=true
+    CODEOWNERS=$(gh_retry api --paginate "repos/$REPO/collaborators?permission=admin&affiliation=all" \
+      -q '.[] | select(.type == "User") | .login' | paste -sd, -)
+    [[ -n $CODEOWNERS ]] || die "No admins found. Pass --codeowners user1,my-org/team"
+  fi
+
+  owner_list=()
+  IFS=, read -ra entries <<<"$CODEOWNERS"
+  for entry in "${entries[@]}"; do
+    entry=${entry// /}
+    entry=${entry#@}
+    [[ -n $entry ]] && owner_list+=("$entry")
+  done
+  (( ${#owner_list[@]} > 0 )) || die "--codeowners is empty."
+
+  invalid=0
+  for owner in "${owner_list[@]}"; do
+    check_owner "$owner" || invalid=$(( invalid + 1 ))
+  done
+  (( invalid == 0 )) || die "Code owners need write access to $REPO, or GitHub ignores them and PRs can't get the required approval. Fix the list above."
+
+  owners=$(printf ' @%s' "${owner_list[@]}")
+  info "Code owners who can approve:$owners"
+
+  # Auto-detected admins in an org can include every org owner. Each code owner is
+  # asked to review every PR, so make sure this list is wanted.
+  if $auto_detected && [[ $in_org == true || ${#owner_list[@]} -gt 1 ]] && ! $DRY_RUN; then
+    [[ -t 0 ]] || die "Found ${#owner_list[@]} admins. Pass --codeowners to say who should approve."
+    confirm "Each of them will be asked to review every PR. Use this list?" n \
+      || die "Aborted. Pass --codeowners user1,my-org/team to choose who approves."
+  fi
+fi
+
 # 1. Branches -------------------------------------------------------------------
 main_sha=$(branch_sha "$MAIN_BRANCH") \
   || die "Branch '$MAIN_BRANCH' not found. Push an initial commit to it first."
@@ -111,23 +172,9 @@ else
   ok "Created $DEV_BRANCH from $MAIN_BRANCH"
 fi
 
-# 2. CODEOWNERS: the admins who must approve --------------------------------------
+# 2. CODEOWNERS: who must approve ---------------------------------------------------
 # This must happen before the ruleset is active, otherwise the commit is blocked.
 if $WRITE_CODEOWNERS; then
-  if [[ -z $ADMINS ]]; then
-    ADMINS=$(gh_retry api --paginate "repos/$REPO/collaborators?permission=admin&affiliation=all" \
-      -q '.[] | select(.type == "User") | .login' | paste -sd, -)
-  fi
-  [[ -n $ADMINS ]] || die "No admins found. Pass --admins user1,user2"
-
-  owners=""
-  IFS=, read -ra admin_list <<<"$ADMINS"
-  for a in "${admin_list[@]}"; do
-    a=${a// /}
-    [[ -n $a ]] && owners+=" @${a#@}"
-  done
-  info "Admins who must approve:$owners"
-
   codeowners=$(printf '%s\n' \
     "# Managed by protect-repo.sh. A PR into a protected branch needs approval" \
     "# from at least one of these owners." \
@@ -147,7 +194,7 @@ if $WRITE_CODEOWNERS; then
       continue
     fi
     args=(-X PUT "$path" -f branch="$branch"
-          -f message="chore: set CODEOWNERS so admins approve PRs"
+          -f message="chore: set CODEOWNERS for required PR approvals"
           -f content="$(printf '%s\n' "$codeowners" | base64 | tr -d '\n')")
     sha=$(gh_retry api "$path?ref=$branch" -q .sha 2>/dev/null || true)
     [[ -n $sha ]] && args+=(-f sha="$sha")
