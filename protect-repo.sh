@@ -52,17 +52,50 @@ done
 if ! [[ $APPROVALS =~ ^[0-9]+$ ]] || (( APPROVALS < 1 || APPROVALS > 10 )); then
   die "--approvals must be 1-10"
 fi
+# gh with retries for connections that never got established (flaky VM/container
+# networks). Those errors happen before a request is sent, so retrying is safe even
+# for writes. Any other error is printed and returned straight away.
+gh_retry() {
+  local attempt err rc
+  err=$(mktemp)
+  for attempt in 1 2 3 4; do
+    gh "$@" 2>"$err" && { rm -f "$err"; return 0; }
+    rc=$?
+    grep -qE 'dial tcp|no such host|TLS handshake timeout' "$err" || break
+    (( attempt < 4 )) && sleep $(( attempt * 2 ))
+  done
+  cat "$err" >&2
+  rm -f "$err"
+  return "$rc"
+}
+
 have gh || die "gh not found. Run ./setup-gh.sh first."
-gh auth status -h github.com >/dev/null 2>&1 || die "Not logged in. Run: gh auth login"
+gh_retry auth status -h github.com >/dev/null || die "gh is not logged in (see above). Run: gh auth login"
 
 if [[ -z $REPO ]]; then
-  REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
-    || die "Not inside a GitHub repo. Pass OWNER/REPO."
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "$(pwd) is not a git repository. cd into one, or pass OWNER/REPO."
+  REPO=$(gh_retry repo view --json nameWithOwner -q .nameWithOwner) \
+    || die "Couldn't work out the GitHub repo for $(pwd) (see above). Pass OWNER/REPO."
 fi
+permission=$(gh_retry repo view "$REPO" --json viewerPermission -q .viewerPermission) \
+  || die "Can't access $REPO (see above). Check the name and that you have access."
+[[ $permission == ADMIN ]] \
+  || die "You need admin rights on $REPO to manage rulesets (you have: ${permission:-none})."
 info "Repository: $REPO"
 $DRY_RUN && warn "Dry run: nothing will be changed."
 
-branch_sha() { gh api "repos/$REPO/git/ref/heads/$1" -q .object.sha 2>/dev/null; }
+# Print a branch's commit SHA. Returns 1 if the branch doesn't exist; dies on other errors.
+branch_sha() {
+  local out
+  if out=$(gh_retry api "repos/$REPO/git/ref/heads/$1" -q .object.sha 2>&1); then
+    echo "$out"
+    return 0
+  fi
+  [[ $out == *"HTTP 404"* ]] && return 1
+  [[ $out == *"HTTP 409"* ]] && die "$REPO is empty. Push an initial commit to $MAIN_BRANCH first."
+  die "Couldn't look up branch '$1' in $REPO: $out"
+}
 
 # 1. Branches -------------------------------------------------------------------
 main_sha=$(branch_sha "$MAIN_BRANCH") \
@@ -74,7 +107,7 @@ if branch_sha "$DEV_BRANCH" >/dev/null; then
 elif $DRY_RUN; then
   info "[dry-run] would create $DEV_BRANCH from $MAIN_BRANCH ($main_sha)"
 else
-  gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$DEV_BRANCH" -f sha="$main_sha" >/dev/null
+  gh_retry api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$DEV_BRANCH" -f sha="$main_sha" >/dev/null
   ok "Created $DEV_BRANCH from $MAIN_BRANCH"
 fi
 
@@ -82,7 +115,7 @@ fi
 # This must happen before the ruleset is active, otherwise the commit is blocked.
 if $WRITE_CODEOWNERS; then
   if [[ -z $ADMINS ]]; then
-    ADMINS=$(gh api --paginate "repos/$REPO/collaborators?permission=admin&affiliation=all" \
+    ADMINS=$(gh_retry api --paginate "repos/$REPO/collaborators?permission=admin&affiliation=all" \
       -q '.[] | select(.type == "User") | .login' | paste -sd, -)
   fi
   [[ -n $ADMINS ]] || die "No admins found. Pass --admins user1,user2"
@@ -102,7 +135,8 @@ if $WRITE_CODEOWNERS; then
 
   for branch in "$MAIN_BRANCH" "$DEV_BRANCH"; do
     path="repos/$REPO/contents/.github/CODEOWNERS"
-    current=$(gh api "$path?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
+    # Exits non-zero (404) when there's no CODEOWNERS yet.
+    current=$(gh_retry api "$path?ref=$branch" -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
     if [[ $current == "$codeowners" ]]; then
       ok "CODEOWNERS up to date on $branch"
       continue
@@ -115,9 +149,9 @@ if $WRITE_CODEOWNERS; then
     args=(-X PUT "$path" -f branch="$branch"
           -f message="chore: set CODEOWNERS so admins approve PRs"
           -f content="$(printf '%s\n' "$codeowners" | base64 | tr -d '\n')")
-    sha=$(gh api "$path?ref=$branch" -q .sha 2>/dev/null || true)
+    sha=$(gh_retry api "$path?ref=$branch" -q .sha 2>/dev/null || true)
     [[ -n $sha ]] && args+=(-f sha="$sha")
-    gh api "${args[@]}" >/dev/null \
+    gh_retry api "${args[@]}" >/dev/null \
       || die "Couldn't commit CODEOWNERS to $branch. If it's already protected, change CODEOWNERS via a PR and re-run with --skip-codeowners."
     ok "Committed .github/CODEOWNERS to $branch"
   done
@@ -153,8 +187,9 @@ ruleset=$(cat <<JSON
 JSON
 )
 
-existing_id=$(gh api "repos/$REPO/rulesets?includes_parents=false" \
-  -q ".[] | select(.name == \"$RULESET_NAME\") | .id" 2>/dev/null || true)
+existing_id=$(gh_retry api "repos/$REPO/rulesets?includes_parents=false" \
+  -q ".[] | select(.name == \"$RULESET_NAME\") | .id") \
+  || die "Couldn't list existing rulesets for $REPO (see above)."
 
 if $DRY_RUN; then
   info "[dry-run] would ${existing_id:+update ruleset $existing_id}${existing_id:-create ruleset} with:"
@@ -167,13 +202,13 @@ if [[ -n $existing_id ]]; then
 else
   method=POST endpoint="repos/$REPO/rulesets"
 fi
-if ! out=$(gh api -X "$method" "$endpoint" --input - <<<"$ruleset" 2>&1); then
+if ! id=$(gh_retry api -X "$method" "$endpoint" --input - -q .id <<<"$ruleset" 2>&1); then
+  out=$id
   echo "$out" >&2
   [[ $out == *"Upgrade to GitHub Pro"* || $out == *"403"* ]] \
     && warn "Rulesets on private repos need GitHub Pro/Team (or make the repo public)."
   die "Failed to apply ruleset."
 fi
-id=$(jq -r .id <<<"$out" 2>/dev/null || echo "${existing_id:-?}")
 ok "Ruleset '$RULESET_NAME' (id $id) is active on $MAIN_BRANCH and $DEV_BRANCH"
 
 cat <<MSG

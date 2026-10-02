@@ -67,18 +67,33 @@ To pin a version for reproducible images, set `GH_VERSION=2.62.0` (tarball insta
 
 ## Protecting a repo
 
+Run it from inside the project's folder, and the repo is taken from the folder's
+git remote:
+
 ```bash
-./protect-repo.sh OWNER/REPO --dry-run      # show the plan
-./protect-repo.sh OWNER/REPO                # apply
-./protect-repo.sh OWNER/REPO --admin-bypass # solo projects, see below
+cd ~/code/my_project
+bash ~/agent-project-onboard/protect-repo.sh --dry-run   # show the plan
+bash ~/agent-project-onboard/protect-repo.sh             # apply
 ```
+
+Or run it from anywhere and name the repo, which can be yours or an organisation's:
+
+```bash
+./protect-repo.sh OWNER/REPO --dry-run
+./protect-repo.sh my-org/my_project --admins my-org/maintainers
+./protect-repo.sh OWNER/REPO --admin-bypass   # solo projects, see below
+```
+
+You need admin rights on the repo. The script checks this first, and it retries
+when the connection to GitHub can't be made.
 
 What it does:
 
 1. Creates `development` from `main` if it doesn't exist.
 2. Commits `.github/CODEOWNERS` with `* @admin1 @admin2` to both branches. By
-   default these are the repo's admin collaborators; set them with `--admins`.
-   Org teams work too: `--admins my-org/maintainers`.
+   default these are the repo's admin collaborators. In an org that includes
+   every org owner, so a team is usually better: `--admins my-org/maintainers`.
+   The team needs write access to the repo.
 3. Creates or updates a **repository ruleset** named
    `protect-main-and-development` on both branches:
    - no direct pushes; every change must come through a pull request
@@ -105,8 +120,8 @@ directly.
 
 ### Limitations
 
-- Rulesets on **private** repos need GitHub Pro, Team, or Enterprise. On the Free
-  plan they work only on public repos. The script tells you if GitHub refuses.
+- Rulesets on **private** repos need GitHub Pro (personal accounts) or Team
+  (organisations). On the Free plan they work only on public repos. The script tells you if GitHub refuses.
 - After protection is on, edit CODEOWNERS through a PR, then re-run with
   `--skip-codeowners`.
 - Inspect the result with `gh ruleset list`, `gh ruleset view <id>`, and
